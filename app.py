@@ -2,6 +2,10 @@ from flask import Flask, render_template, request, jsonify
 from flask_cors import CORS
 from transformers import MarianTokenizer
 import nltk
+import os
+import re
+import urllib.request
+import urllib.error
 from nltk.stem import WordNetLemmatizer
 import pickle
 import numpy as np
@@ -301,6 +305,153 @@ def generate_nlp_response(user_text, sentiment_info):
     else:
         return "I'm here to help. Could you tell me more about what you'd like to discuss?"
 
+
+# --- LLM CONFIGURATION (OLLAMA) ---
+USE_LLM = os.getenv("USE_LLM", "true").lower() == "true"
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:14b-instruct")
+OLLAMA_CHAT_URL = os.getenv("OLLAMA_CHAT_URL", "http://localhost:11434/api/chat")
+OLLAMA_TAGS_URL = os.getenv("OLLAMA_TAGS_URL", "http://localhost:11434/api/tags")
+LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "45"))
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.5"))
+LLM_TOP_P = float(os.getenv("LLM_TOP_P", "0.9"))
+DEFAULT_RESPONSE_STYLE = os.getenv("RESPONSE_STYLE", "balanced").strip().lower()
+
+MENTAL_HEALTH_SYSTEM_PROMPT = (
+    "You are a supportive mental-health assistant for educational and emotional support only. "
+    "Use warm, non-judgmental language. Do not diagnose medical conditions, and do not claim to be a therapist or doctor. "
+    "Provide practical coping steps (breathing, grounding, journaling, sleep hygiene, social support), and encourage professional help when symptoms persist or worsen. "
+    "If user indicates self-harm, suicide, or immediate danger, prioritize safety: advise contacting local emergency services and a trusted person immediately. "
+    "Keep answers concise, clear, and actionable."
+)
+
+STYLE_INSTRUCTIONS = {
+    "balanced": "Give a warm, practical response in about 4-7 sentences with concrete next steps.",
+    "concise": "Keep the response brief (2-4 sentences), direct, and practical.",
+    "therapeutic": "Use a more reflective, validating tone and include 1-2 grounding or coping exercises."
+}
+
+CRISIS_PATTERNS = [
+    # English phrases
+    re.compile(r"\b(kill|hurt)\s+myself\b", re.IGNORECASE),
+    re.compile(r"\b(end\s+my\s+life|want\s+to\s+die|commit\s+suicide)\b", re.IGNORECASE),
+    re.compile(r"\b(no\s+reason\s+to\s+live|better\s+off\s+dead)\b", re.IGNORECASE),
+    re.compile(r"\b(i\s+am\s+going\s+to\s+die|i\s+will\s+kill\s+myself)\b", re.IGNORECASE),
+    # Swahili phrases
+    re.compile(r"\bnataka\s+kufa\b", re.IGNORECASE),
+    re.compile(r"\bnitajiua\b", re.IGNORECASE),
+    re.compile(r"\bkujiua\b", re.IGNORECASE),
+    re.compile(r"\bsiwezi\s+kuendelea\s+kuishi\b", re.IGNORECASE),
+]
+
+
+def get_style_instruction(style):
+    """Return style instruction for prompt tuning."""
+    normalized = (style or DEFAULT_RESPONSE_STYLE).strip().lower()
+    return STYLE_INSTRUCTIONS.get(normalized, STYLE_INSTRUCTIONS["balanced"])
+
+
+def contains_crisis_language(raw_text, processing_text):
+    """Detect high-risk language using regex, multilingual phrases, and intent confidence."""
+    text_candidates = [raw_text or "", processing_text or ""]
+
+    # Regex and phrase detection across original + translated text.
+    for text in text_candidates:
+        for pattern in CRISIS_PATTERNS:
+            if pattern.search(text):
+                return True
+
+    # Intent-based detection from existing classifier for additional safety coverage.
+    intent, confidence, _ = get_nlp_prediction(processing_text or "")
+    if intent == "suicide" and confidence >= 0.25:
+        return True
+
+    return False
+
+
+def get_crisis_response():
+    """Safety-first response for high-risk messages."""
+    return (
+        "I'm really glad you shared this. You deserve immediate support right now. "
+        "If you might act on these thoughts, please call your local emergency number now and reach out to someone you trust who can stay with you. "
+        "You can also contact a crisis hotline in your country right away. "
+        "If you want, I can help you write a short message to ask for urgent help."
+    )
+
+
+def generate_llm_response(user_text, sentiment_info, response_style=None):
+    """Generate response via Ollama chat API. Returns None on failure."""
+    try:
+        style_instruction = get_style_instruction(response_style)
+        user_prompt = (
+            f"User message: {user_text}\n"
+            f"Detected sentiment: {sentiment_info['sentiment']} (polarity={sentiment_info['polarity']:.2f}).\n"
+            f"Style instruction: {style_instruction}\n"
+            "Respond with emotional support and practical next steps."
+        )
+
+        payload = {
+            "model": OLLAMA_MODEL,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": MENTAL_HEALTH_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt}
+            ],
+            "options": {
+                "temperature": LLM_TEMPERATURE,
+                "top_p": LLM_TOP_P
+            }
+        }
+
+        req = urllib.request.Request(
+            OLLAMA_CHAT_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+
+        with urllib.request.urlopen(req, timeout=LLM_TIMEOUT_SECONDS) as response:
+            response_text = response.read().decode("utf-8")
+            response_data = json.loads(response_text)
+
+        message = response_data.get("message", {})
+        content = message.get("content", "").strip()
+        return content or None
+
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
+        print(f"LLM Error: {e}")
+        return None
+
+
+def check_ollama_status():
+    """Check Ollama API reachability and whether configured model is available."""
+    status = {
+        "enabled": USE_LLM,
+        "chat_url": OLLAMA_CHAT_URL,
+        "tags_url": OLLAMA_TAGS_URL,
+        "model": OLLAMA_MODEL,
+        "service_reachable": False,
+        "model_available": False,
+        "error": None,
+    }
+
+    if not USE_LLM:
+        return status
+
+    try:
+        req = urllib.request.Request(OLLAMA_TAGS_URL, method="GET")
+        with urllib.request.urlopen(req, timeout=10) as response:
+            response_text = response.read().decode("utf-8")
+            data = json.loads(response_text)
+
+        models = data.get("models", [])
+        names = [m.get("name", "") for m in models]
+        status["service_reachable"] = True
+        status["model_available"] = any(name.startswith(OLLAMA_MODEL) for name in names)
+    except Exception as e:
+        status["error"] = str(e)
+
+    return status
+
 # --- FLASK APP ---
 
 app = Flask(__name__)
@@ -314,6 +465,11 @@ def home():
 @app.route("/get")
 def get_bot_response():
     userText = request.args.get('msg')
+    response_style = request.args.get('style', DEFAULT_RESPONSE_STYLE)
+
+    if not userText:
+        return "Please type a message so I can help."
+
     print(f"\n{'='*50}")
     print(f"Raw Input: {userText}")
 
@@ -332,9 +488,20 @@ def get_bot_response():
 
     # 3. NLP Analysis
     sentiment_info = analyze_sentiment(processing_text)
-    
-    # 4. Generate NLP-enhanced response
-    bot_response_en = generate_nlp_response(processing_text, sentiment_info)
+
+    # 4. Safety gate + LLM/NLP response selection
+    if contains_crisis_language(userText, processing_text):
+        bot_response_en = get_crisis_response()
+    else:
+        bot_response_en = None
+
+        if USE_LLM:
+            bot_response_en = generate_llm_response(processing_text, sentiment_info, response_style)
+
+        # Fall back to the existing NLP pipeline when LLM is disabled/unavailable.
+        if not bot_response_en:
+            bot_response_en = generate_nlp_response(processing_text, sentiment_info)
+
     print(f"Bot Response (En): {bot_response_en}")
 
     # 5. Final Output Processing
@@ -347,6 +514,31 @@ def get_bot_response():
 
     print(f"{'='*50}\n")
     return final_response
+
+
+@app.route("/health")
+def health_check():
+    """Health endpoint for Flask + Ollama/model availability."""
+    ollama_status = check_ollama_status()
+
+    return jsonify({
+        "status": "ok",
+        "flask": {
+            "up": True
+        },
+        "llm": {
+            "enabled": ollama_status["enabled"],
+            "service_reachable": ollama_status["service_reachable"],
+            "model": ollama_status["model"],
+            "model_available": ollama_status["model_available"],
+            "chat_url": ollama_status["chat_url"],
+            "tags_url": ollama_status["tags_url"],
+            "error": ollama_status["error"]
+        },
+        "response_style": DEFAULT_RESPONSE_STYLE,
+        "llm_temperature": LLM_TEMPERATURE,
+        "llm_top_p": LLM_TOP_P
+    })
 
 
 @app.route("/analyze")

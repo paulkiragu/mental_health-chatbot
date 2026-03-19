@@ -104,6 +104,53 @@ npm install
 
 ---
 
+## 🔧 Setup with LLM Integration (New Developers)
+
+This project now includes **Ollama + Qwen LLM** for enhanced mental health responses. Here's what you need to know:
+
+### System Requirements (Beyond Python/Node)
+
+You'll need **Ollama** (the LLM service) running separately:
+
+1. **Install Ollama**
+   - Download from: https://ollama.com/
+   - Follow the installer for your OS (Linux, macOS, Windows)
+   - Verify installation: `ollama --version`
+
+2. **Copy Environment Configuration**
+   ```bash
+   cp .env.example .env
+   # Edit .env if needed (defaults work for local development)
+   ```
+
+3. **Pull the LLM Model** (one-time, ~8-10GB)
+   ```bash
+   ollama pull qwen2.5:14b-instruct
+   # Verify: ollama list
+   ```
+
+### Initial Setup Summary
+
+```bash
+# 1. Clone and backend setup (as above)
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+python -m spacy download en_core_web_sm
+
+# 2. Frontend setup
+cd frontend
+npm install
+cd ..
+
+# 3. Install Ollama (see above)
+
+# 4. Copy environment file
+cp .env.example .env
+```
+
+---
+
 ## 🏃 Running the Application
 
 You need to run **both** the backend and frontend servers.
@@ -197,7 +244,69 @@ Create a `.env` file in the root directory:
 ```env
 FLASK_DEBUG=1
 HF_TOKEN=your_huggingface_token  # For faster model downloads
+USE_LLM=true
+OLLAMA_MODEL=qwen2.5:14b-instruct
+OLLAMA_CHAT_URL=http://localhost:11434/api/chat
+OLLAMA_TAGS_URL=http://localhost:11434/api/tags
+LLM_TIMEOUT_SECONDS=45
+LLM_TEMPERATURE=0.5
+LLM_TOP_P=0.9
+RESPONSE_STYLE=balanced
 ```
+
+### Ollama Setup (Open-Source LLM)
+
+This project supports local LLM responses via [Ollama](https://ollama.com/), with automatic fallback to the existing NLP intent pipeline if Ollama is unavailable.
+
+1. Install Ollama for your OS.
+2. Pull a recommended model:
+
+```bash
+ollama pull qwen2.5:14b-instruct
+```
+
+3. Start Ollama service (if not already running).
+4. Run the Flask app normally:
+
+```bash
+python app.py
+```
+
+Notes:
+- `USE_LLM=true` enables LLM responses.
+- If Ollama cannot be reached, the app falls back to the existing semantic/intent response engine.
+- Crisis/self-harm phrases are handled by a safety-first response before LLM generation.
+
+### Health Check Endpoint
+
+You can verify backend + Ollama integration with:
+
+```bash
+curl http://127.0.0.1:5000/health
+```
+
+The `/health` response includes:
+- Flask status (`flask.up`)
+- Ollama service reachability (`llm.service_reachable`)
+- Configured model availability (`llm.model_available`)
+- Active style and sampling settings (`response_style`, `llm_temperature`, `llm_top_p`)
+
+### Response Style Tuning
+
+You can choose global style through `.env`:
+- `RESPONSE_STYLE=concise`
+- `RESPONSE_STYLE=balanced`
+- `RESPONSE_STYLE=therapeutic`
+
+You can also override style per request:
+
+```text
+/get?msg=I%20feel%20overwhelmed&style=therapeutic
+```
+
+The model sampling can be tuned using:
+- `LLM_TEMPERATURE` (lower = more deterministic, higher = more creative)
+- `LLM_TOP_P` (nucleus sampling)
 
 ### Vite Proxy Configuration
 
