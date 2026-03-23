@@ -7,6 +7,7 @@ import re
 import urllib.request
 import urllib.error
 from nltk.stem import WordNetLemmatizer
+from nltk.corpus import wordnet
 import pickle
 import numpy as np
 from keras.models import load_model
@@ -27,6 +28,15 @@ try:
 except LookupError:
     nltk.download('popular')
     nltk.download('punkt_tab')
+
+# WordNet is required by the lemmatizer and can fail under lazy-load race conditions.
+try:
+    nltk.data.find('corpora/wordnet')
+except LookupError:
+    nltk.download('wordnet')
+
+# Force eager load once during startup to avoid first-request lazy loader issues.
+wordnet.ensure_loaded()
 
 lemmatizer = WordNetLemmatizer()
 

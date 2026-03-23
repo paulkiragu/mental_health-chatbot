@@ -46,7 +46,11 @@ function App() {
         </div>
       </main>
 
-      <ChatWidget isOpen={isChatOpen} onClose={() => setIsChatOpen(false)} />
+      <ChatWidget
+        isOpen={isChatOpen}
+        onOpen={() => setIsChatOpen(true)}
+        onClose={() => setIsChatOpen(false)}
+      />
     </div>
   )
 }
