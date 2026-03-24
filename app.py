@@ -316,11 +316,20 @@ def generate_nlp_response(user_text, sentiment_info):
         return "I'm here to help. Could you tell me more about what you'd like to discuss?"
 
 
-# --- LLM CONFIGURATION (OLLAMA) ---
+# --- LLM CONFIGURATION (OLLAMA or Google Gemini) ---
 USE_LLM = os.getenv("USE_LLM", "true").lower() == "true"
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()  # "gemini" or "ollama"
+
+# Gemini Configuration
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-pro")
+GEMINI_CHAT_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+# Ollama Configuration (fallback)
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:14b-instruct")
 OLLAMA_CHAT_URL = os.getenv("OLLAMA_CHAT_URL", "http://localhost:11434/api/chat")
 OLLAMA_TAGS_URL = os.getenv("OLLAMA_TAGS_URL", "http://localhost:11434/api/tags")
+
 LLM_TIMEOUT_SECONDS = int(os.getenv("LLM_TIMEOUT_SECONDS", "45"))
 LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.5"))
 LLM_TOP_P = float(os.getenv("LLM_TOP_P", "0.9"))
@@ -388,7 +397,64 @@ def get_crisis_response():
     )
 
 
-def generate_llm_response(user_text, sentiment_info, response_style=None):
+def generate_gemini_response(user_text, sentiment_info, response_style=None):
+    """Generate response via Google Gemini API. Returns None on failure."""
+    if not GEMINI_API_KEY:
+        print("Gemini API key not configured.")
+        return None
+    
+    try:
+        style_instruction = get_style_instruction(response_style)
+        user_prompt = (
+            f"User message: {user_text}\n"
+            f"Detected sentiment: {sentiment_info['sentiment']} (polarity={sentiment_info['polarity']:.2f}).\n"
+            f"Style instruction: {style_instruction}\n"
+            "Respond with emotional support and practical next steps."
+        )
+
+        url = GEMINI_CHAT_URL.format(model=GEMINI_MODEL) + f"?key={GEMINI_API_KEY}"
+        
+        payload = {
+            "contents": [
+                {
+                    "parts": [
+                        {"text": MENTAL_HEALTH_SYSTEM_PROMPT},
+                        {"text": user_prompt}
+                    ]
+                }
+            ],
+            "generationConfig": {
+                "temperature": LLM_TEMPERATURE,
+                "topP": LLM_TOP_P,
+                "maxOutputTokens": 500
+            }
+        }
+
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+
+        with urllib.request.urlopen(req, timeout=LLM_TIMEOUT_SECONDS) as response:
+            response_text = response.read().decode("utf-8")
+            response_data = json.loads(response_text)
+
+        if "candidates" in response_data and response_data["candidates"]:
+            content = response_data["candidates"][0].get("content", {})
+            parts = content.get("parts", [])
+            if parts:
+                return parts[0].get("text", "").strip() or None
+        
+        return None
+
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
+        print(f"Gemini Error: {e}")
+        return None
+
+
+def generate_ollama_response(user_text, sentiment_info, response_style=None):
     """Generate response via Ollama chat API. Returns None on failure."""
     try:
         style_instruction = get_style_instruction(response_style)
@@ -428,14 +494,58 @@ def generate_llm_response(user_text, sentiment_info, response_style=None):
         return content or None
 
     except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
-        print(f"LLM Error: {e}")
+        print(f"Ollama Error: {e}")
         return None
+
+
+def generate_llm_response(user_text, sentiment_info, response_style=None):
+    """Generate response via configured LLM provider (Gemini or Ollama). Returns None on failure."""
+    if LLM_PROVIDER == "gemini":
+        return generate_gemini_response(user_text, sentiment_info, response_style)
+    else:
+        return generate_ollama_response(user_text, sentiment_info, response_style)
+
+
+def check_gemini_status():
+    """Check Google Gemini API reachability."""
+    status = {
+        "provider": "gemini",
+        "model": GEMINI_MODEL,
+        "service_reachable": False,
+        "api_key_configured": bool(GEMINI_API_KEY),
+        "error": None,
+    }
+    
+    if not GEMINI_API_KEY:
+        status["error"] = "Gemini API key not configured"
+        return status
+    
+    try:
+        # Test endpoint
+        url = GEMINI_CHAT_URL.format(model=GEMINI_MODEL) + f"?key={GEMINI_API_KEY}"
+        payload = {"contents": [{"parts": [{"text": "test"}]}]}
+        
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST"
+        )
+        
+        with urllib.request.urlopen(req, timeout=10) as response:
+            response.read()
+        
+        status["service_reachable"] = True
+    except Exception as e:
+        status["error"] = str(e)
+    
+    return status
 
 
 def check_ollama_status():
     """Check Ollama API reachability and whether configured model is available."""
     status = {
-        "enabled": USE_LLM,
+        "provider": "ollama",
         "chat_url": OLLAMA_CHAT_URL,
         "tags_url": OLLAMA_TAGS_URL,
         "model": OLLAMA_MODEL,
@@ -443,9 +553,6 @@ def check_ollama_status():
         "model_available": False,
         "error": None,
     }
-
-    if not USE_LLM:
-        return status
 
     try:
         req = urllib.request.Request(OLLAMA_TAGS_URL, method="GET")
@@ -528,8 +635,11 @@ def get_bot_response():
 
 @app.route("/health")
 def health_check():
-    """Health endpoint for Flask + Ollama/model availability."""
-    ollama_status = check_ollama_status()
+    """Health endpoint for Flask + LLM provider (Gemini or Ollama)."""
+    if LLM_PROVIDER == "gemini":
+        llm_status = check_gemini_status()
+    else:
+        llm_status = check_ollama_status()
 
     return jsonify({
         "status": "ok",
@@ -537,13 +647,9 @@ def health_check():
             "up": True
         },
         "llm": {
-            "enabled": ollama_status["enabled"],
-            "service_reachable": ollama_status["service_reachable"],
-            "model": ollama_status["model"],
-            "model_available": ollama_status["model_available"],
-            "chat_url": ollama_status["chat_url"],
-            "tags_url": ollama_status["tags_url"],
-            "error": ollama_status["error"]
+            "enabled": USE_LLM,
+            "provider": LLM_PROVIDER,
+            **llm_status
         },
         "response_style": DEFAULT_RESPONSE_STYLE,
         "llm_temperature": LLM_TEMPERATURE,
