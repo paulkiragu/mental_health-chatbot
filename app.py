@@ -6,6 +6,7 @@ import os
 import re
 import urllib.request
 import urllib.error
+from dotenv import load_dotenv
 from nltk.stem import WordNetLemmatizer
 from nltk.corpus import wordnet
 import pickle
@@ -22,6 +23,9 @@ from sentence_transformers import SentenceTransformer, util
 from textblob import TextBlob
 
 # --- NLTK Setup ---
+# Load environment variables from .env for local development.
+load_dotenv()
+
 # Only download if not present to speed up restart
 try:
     nltk.data.find('tokenizers/punkt')
@@ -316,16 +320,21 @@ def generate_nlp_response(user_text, sentiment_info):
         return "I'm here to help. Could you tell me more about what you'd like to discuss?"
 
 
-# --- LLM CONFIGURATION (OLLAMA or Google Gemini) ---
+# --- LLM CONFIGURATION (Groq, Gemini, or Ollama) ---
 USE_LLM = os.getenv("USE_LLM", "true").lower() == "true"
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()  # "gemini" or "ollama"
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq").lower()  # "groq", "gemini", or "ollama"
+
+# Groq Configuration (recommended - free, fast, OpenAI-compatible)
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "mixtral-8x7b-32768")
+GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # Gemini Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-pro")
 GEMINI_CHAT_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
-# Ollama Configuration (fallback)
+# Ollama Configuration (local)
 OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:14b-instruct")
 OLLAMA_CHAT_URL = os.getenv("OLLAMA_CHAT_URL", "http://localhost:11434/api/chat")
 OLLAMA_TAGS_URL = os.getenv("OLLAMA_TAGS_URL", "http://localhost:11434/api/tags")
@@ -395,6 +404,58 @@ def get_crisis_response():
         "You can also contact a crisis hotline in your country right away. "
         "If you want, I can help you write a short message to ask for urgent help."
     )
+
+
+def generate_groq_response(user_text, sentiment_info, response_style=None):
+    """Generate response via Groq API (OpenAI-compatible). Returns None on failure."""
+    if not GROQ_API_KEY:
+        print("Groq API key not configured.")
+        return None
+    
+    try:
+        style_instruction = get_style_instruction(response_style)
+        user_prompt = (
+            f"User message: {user_text}\n"
+            f"Detected sentiment: {sentiment_info['sentiment']} (polarity={sentiment_info['polarity']:.2f}).\n"
+            f"Style instruction: {style_instruction}\n"
+            "Respond with emotional support and practical next steps."
+        )
+
+        payload = {
+            "model": GROQ_MODEL,
+            "messages": [
+                {"role": "system", "content": MENTAL_HEALTH_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": LLM_TEMPERATURE,
+            "top_p": LLM_TOP_P,
+            "max_tokens": 500
+        }
+
+        req = urllib.request.Request(
+            GROQ_CHAT_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {GROQ_API_KEY}"
+            },
+            method="POST"
+        )
+
+        with urllib.request.urlopen(req, timeout=LLM_TIMEOUT_SECONDS) as response:
+            response_text = response.read().decode("utf-8")
+            response_data = json.loads(response_text)
+
+        if "choices" in response_data and response_data["choices"]:
+            message = response_data["choices"][0].get("message", {})
+            content = message.get("content", "").strip()
+            return content or None
+        
+        return None
+
+    except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as e:
+        print(f"Groq Error: {e}")
+        return None
 
 
 def generate_gemini_response(user_text, sentiment_info, response_style=None):
@@ -499,11 +560,54 @@ def generate_ollama_response(user_text, sentiment_info, response_style=None):
 
 
 def generate_llm_response(user_text, sentiment_info, response_style=None):
-    """Generate response via configured LLM provider (Gemini or Ollama). Returns None on failure."""
-    if LLM_PROVIDER == "gemini":
+    """Generate response via configured LLM provider (Groq, Gemini, or Ollama). Returns None on failure."""
+    if LLM_PROVIDER == "groq":
+        return generate_groq_response(user_text, sentiment_info, response_style)
+    elif LLM_PROVIDER == "gemini":
         return generate_gemini_response(user_text, sentiment_info, response_style)
     else:
         return generate_ollama_response(user_text, sentiment_info, response_style)
+
+
+def check_groq_status():
+    """Check Groq API reachability."""
+    status = {
+        "provider": "groq",
+        "model": GROQ_MODEL,
+        "service_reachable": False,
+        "api_key_configured": bool(GROQ_API_KEY),
+        "error": None,
+    }
+    
+    if not GROQ_API_KEY:
+        status["error"] = "Groq API key not configured"
+        return status
+    
+    try:
+        payload = {
+            "model": GROQ_MODEL,
+            "messages": [{"role": "user", "content": "test"}],
+            "max_tokens": 10
+        }
+        
+        req = urllib.request.Request(
+            GROQ_CHAT_URL,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {GROQ_API_KEY}"
+            },
+            method="POST"
+        )
+        
+        with urllib.request.urlopen(req, timeout=10) as response:
+            response.read()
+        
+        status["service_reachable"] = True
+    except Exception as e:
+        status["error"] = str(e)
+    
+    return status
 
 
 def check_gemini_status():
@@ -635,8 +739,10 @@ def get_bot_response():
 
 @app.route("/health")
 def health_check():
-    """Health endpoint for Flask + LLM provider (Gemini or Ollama)."""
-    if LLM_PROVIDER == "gemini":
+    """Health endpoint for Flask + LLM provider (Groq, Gemini, or Ollama)."""
+    if LLM_PROVIDER == "groq":
+        llm_status = check_groq_status()
+    elif LLM_PROVIDER == "gemini":
         llm_status = check_gemini_status()
     else:
         llm_status = check_ollama_status()

@@ -13,3 +13,4 @@ transformers==4.35.2
 sentence-transformers
 textblob
 scikit-learn
+python-dotenv
